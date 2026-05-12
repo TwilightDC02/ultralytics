@@ -2071,3 +2071,144 @@ class RealNVP(nn.Module):
             self.float()
         z, log_det = self.backward_p(x)
         return self.prior.log_prob(z) + log_det
+
+# Custom: SPD-Conv + EMA + residual block, with 4-scale backbone.
+# ──────────────────────────────────────────────────────────────────
+
+class SPDConv(nn.Module):
+    """Space-to-depth downsampling — zero information loss.
+    Replaces stride-2 conv: rearranges (C,H,W) → (4C,H/2,W/2)
+    then mixes with 1x1 conv.
+    """
+    def __init__(self, c1: int, c2: int):
+        super().__init__()
+        self.conv = nn.Conv2d(c1 * 4, c2, kernel_size=1, bias=False)
+        self.bn   = nn.BatchNorm2d(c2)
+        self.act  = nn.SiLU(inplace=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = torch.cat(
+            [x[..., 0::2, 0::2], x[..., 1::2, 0::2],
+             x[..., 0::2, 1::2], x[..., 1::2, 1::2]],
+            dim=1,
+        )
+        return self.act(self.bn(self.conv(x)))
+
+
+class EMA(nn.Module):
+    """Efficient Multi-scale Attention (Ouyang et al., 2023).
+    Beats SE/CBAM/CA in YOLOv8 small-object ablations.
+    Cross-references a directional (CA-style) branch and a 3x3
+    local branch through softmax gating.
+    """
+    def __init__(self, c: int, groups: int = 8):
+        super().__init__()
+        self.groups = groups if c % groups == 0 else 1
+        gc = c // self.groups
+        self.gn      = nn.GroupNorm(self.groups, c)
+        self.conv1x1 = nn.Conv2d(gc, gc, 1, bias=False)
+        self.conv3x3 = nn.Conv2d(gc, gc, 3, padding=1, bias=False)
+        self.softmax = nn.Softmax(dim=-1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, c, h, w = x.shape
+        g  = self.groups
+        xg = x.view(b * g, c // g, h, w)
+
+        # directional branch (CA-style)
+        x_h  = xg.mean(dim=3, keepdim=True)
+        x_w  = xg.mean(dim=2, keepdim=True).permute(0, 1, 3, 2)
+        hw   = self.conv1x1(torch.cat([x_h, x_w], dim=2))
+        x_h, x_w = torch.split(hw, [h, w], dim=2)
+        a1   = x_h.sigmoid() * x_w.permute(0, 1, 3, 2).sigmoid()
+        x1   = self.gn(xg.view(b, c, h, w)).view(b * g, c // g, h, w) * a1
+
+        # local spatial branch
+        x2   = self.conv3x3(xg)
+
+        # cross-spatial gating
+        x1p  = x1.mean(dim=(2, 3), keepdim=True).view(b * g, -1, 1)
+        x2f  = x2.view(b * g, c // g, -1)
+        a12  = self.softmax(torch.bmm(x1p.transpose(1, 2), x2f))
+
+        x2p  = x2.mean(dim=(2, 3), keepdim=True).view(b * g, -1, 1)
+        x1f  = x1.view(b * g, c // g, -1)
+        a21  = self.softmax(torch.bmm(x2p.transpose(1, 2), x1f))
+
+        out  = (x1f * a12 + x2f * a21).view(b, c, h, w)
+        return out.sigmoid() * x
+
+
+class SPDEMABlock(nn.Module):
+    """Residual double-conv + EMA attention.
+    Core custom block for tiny aerial object detection.
+    """
+    def __init__(self, c1: int, c2: int, shortcut: bool = True):
+        super().__init__()
+        self.conv1 = nn.Conv2d(c1, c2, 3, padding=1, bias=False)
+        self.bn1   = nn.BatchNorm2d(c2)
+        self.conv2 = nn.Conv2d(c2, c2, 3, padding=1, bias=False)
+        self.bn2   = nn.BatchNorm2d(c2)
+        self.act   = nn.SiLU(inplace=True)
+        self.attn  = EMA(c2)
+        self.use_shortcut = shortcut
+        self.proj  = (
+            nn.Conv2d(c1, c2, 1, bias=False)
+            if shortcut and c1 != c2 else None
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        identity = x if self.proj is None else self.proj(x)
+        out = self.act(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out = self.attn(out)
+        if self.use_shortcut:
+            out = out + identity
+        return self.act(out)
+
+
+class SPDEMABackbone(nn.Module):
+    """4-scale backbone returning [P2, P3, P4, P5].
+    Every downsample uses SPDConv (no strided conv),
+    every stage uses SPDEMABlock.
+    """
+    def __init__(
+        self,
+        c1: int,
+        c2: int = 1024,
+        out_channels=(128, 256, 512, 1024),
+    ):
+        super().__init__()
+        self.c2 = c2
+
+        self.stem   = SPDConv(c1, 64)           # stride 2
+
+        self.down1  = SPDConv(64, 128)           # stride 4
+        self.stage1 = SPDEMABlock(128, 128)      # P2
+
+        self.down2  = SPDConv(128, 256)          # stride 8
+        self.stage2 = SPDEMABlock(256, 256)      # P3
+
+        self.down3  = SPDConv(256, 512)          # stride 16
+        self.stage3 = SPDEMABlock(512, 512)      # P4
+
+        self.down4  = SPDConv(512, 1024)         # stride 32
+        self.stage4 = SPDEMABlock(1024, 1024)    # P5
+
+        self.p2_proj = nn.Conv2d(128,  out_channels[0], 1)
+        self.p3_proj = nn.Conv2d(256,  out_channels[1], 1)
+        self.p4_proj = nn.Conv2d(512,  out_channels[2], 1)
+        self.p5_proj = nn.Conv2d(1024, out_channels[3], 1)
+
+    def forward(self, x: torch.Tensor):
+        x  = self.stem(x)
+        p2 = self.stage1(self.down1(x))
+        p3 = self.stage2(self.down2(p2))
+        p4 = self.stage3(self.down3(p3))
+        p5 = self.stage4(self.down4(p4))
+        return [
+            self.p2_proj(p2),
+            self.p3_proj(p3),
+            self.p4_proj(p4),
+            self.p5_proj(p5),
+        ]

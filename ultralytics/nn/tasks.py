@@ -66,6 +66,7 @@ from ultralytics.nn.modules import (
     SCDown,
     Segment,
     Segment26,
+    SPDEMABackbone,
     TorchVision,
     WorldDetect,
     YOLOEDetect,
@@ -1724,6 +1725,9 @@ def parse_model(d, ch, verbose=True):
             c2 = args[0]
             c1 = ch[f]
             args = [*args[1:]]
+        elif m is SPDEMABackbone:
+            c1, c2 = ch[f], args[0]
+            args = [c1, *args]
         else:
             c2 = ch[f]
 

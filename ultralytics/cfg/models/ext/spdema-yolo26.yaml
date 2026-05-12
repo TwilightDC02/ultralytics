@@ -1,0 +1,53 @@
+# SPDEMABackbone × YOLO26 — 4-scale (P2/P3/P4/P5) for SkyFusion
+nc: 3          # Aircraft, Ship, Vehicle
+end2end: True
+reg_max: 1
+
+scales:
+  n: [0.50, 0.25, 1024]
+  s: [0.50, 0.50, 1024]
+  m: [0.50, 1.00,  512]
+  l: [1.00, 1.00,  512]
+  x: [1.00, 1.50,  512]
+
+backbone:
+  - [-1, 1, SPDEMABackbone, [1024, [128, 256, 512, 1024]]]  # 0
+  - [0,  1, Index, [128,  0]]   # 1  P2 stride 4
+  - [0,  1, Index, [256,  1]]   # 2  P3 stride 8
+  - [0,  1, Index, [512,  2]]   # 3  P4 stride 16
+  - [0,  1, Index, [1024, 3]]   # 4  P5 stride 32
+  - [-1, 1, SPPF,  [1024, 5, 3, True]]  # 5
+  - [-1, 2, C2PSA, [1024]]               # 6
+
+head:
+  # top-down: P5 → P4
+  - [-1,      1, nn.Upsample, [None, 2, "nearest"]]  # 7
+  - [[-1, 3], 1, Concat, [1]]                        # 8
+  - [-1,      2, C3k2, [512, True]]                  # 9
+
+  # top-down: P4 → P3
+  - [-1,      1, nn.Upsample, [None, 2, "nearest"]]  # 10
+  - [[-1, 2], 1, Concat, [1]]                        # 11
+  - [-1,      2, C3k2, [256, True]]                  # 12
+
+  # top-down: P3 → P2
+  - [-1,      1, nn.Upsample, [None, 2, "nearest"]]  # 13
+  - [[-1, 1], 1, Concat, [1]]                        # 14
+  - [-1,      2, C3k2, [128, True]]                  # 15  ← P2 detect
+
+  # bottom-up: P2 → P3
+  - [-1,       1, Conv, [128, 3, 2]]                 # 16
+  - [[-1, 12], 1, Concat, [1]]                       # 17
+  - [-1,       2, C3k2, [256, True]]                 # 18  ← P3 detect
+
+  # bottom-up: P3 → P4
+  - [-1,      1, Conv, [256, 3, 2]]                  # 19
+  - [[-1, 9], 1, Concat, [1]]                        # 20
+  - [-1,      2, C3k2, [512, True]]                  # 21  ← P4 detect
+
+  # bottom-up: P4 → P5
+  - [-1,      1, Conv, [512, 3, 2]]                  # 22
+  - [[-1, 6], 1, Concat, [1]]                        # 23
+  - [-1,      1, C3k2, [1024, True, 0.5, True]]      # 24  ← P5 detect
+
+  - [[15, 18, 21, 24], 1, Detect, [nc]]              # 25
