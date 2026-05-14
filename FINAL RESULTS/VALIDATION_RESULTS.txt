@@ -1,0 +1,10 @@
+=== Final Metrics ===
+mAP50    : 0.5017
+mAP50-95 : 0.2851
+Precision: 0.5875
+Recall   : 0.5251
+
+Per-class results:
+Class:Aircraft Images:149 Instances:1968 Box-P:0.9058 Box-R:0.91413 Box-F1:0.90994 mAP50:0.93083 mAP50-95:0.66202 
+Class:ship Images:150 Instances:406 Box-P:0.38121 Box-R:0.19212 Box-F1:0.25548 mAP50:0.19093 mAP50-95:0.06972 
+Class:vehicle Images:150 Instances:9377 Box-P:0.47556 Box-R:0.46902 Box-F1:0.47227 mAP50:0.3832 mAP50-95:0.12359 
